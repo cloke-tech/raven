@@ -24,6 +24,23 @@
 #include <sys/socket.h>
 #include <unistd.h>
 
+// Auf Darwin laesst sich POSIX-Shm nicht mit read/write benutzen: kleine Datenbloecke gehen ueber eine sofort geloeschte Tempdatei
+static int blob_file(const char *name)
+{
+#ifdef __APPLE__
+	const char *dir = std::getenv("TMPDIR");
+	std::string path = std::string(dir && *dir ? dir : "/tmp") + "/raven-blob-XXXXXX";
+	const int fd = ::mkstemp(path.data());
+	if (fd < 0)
+		return -1;
+	::unlink(path.c_str());
+	::fcntl(fd, F_SETFD, FD_CLOEXEC);
+	return fd;
+#else
+	return ::memfd_create(name, MFD_CLOEXEC);
+#endif
+}
+
 extern char **environ;
 
 namespace raven {
@@ -66,6 +83,12 @@ bool runtime_process_alive(pid_t pid)
 {
 	if (pid <= 0)
 		return false;
+#ifdef __APPLE__
+	const auto process = raven_process(pid);
+	return process.exists && !process.zombie && raven_process_path(pid) == raven_self_exe().string();
+#else
+	if (pid <= 0)
+		return false;
 	std::ifstream stat("/proc/" + std::to_string(pid) + "/stat");
 	std::string text;
 	std::getline(stat, text);
@@ -76,6 +99,7 @@ bool runtime_process_alive(pid_t pid)
 	const auto mine_length = ::readlink("/proc/self/exe", mine, sizeof(mine));
 	const auto theirs_length = ::readlink(("/proc/" + std::to_string(pid) + "/exe").c_str(), theirs, sizeof(theirs));
 	return mine_length > 0 && mine_length == theirs_length && std::equal(mine, mine + mine_length, theirs);
+#endif
 }
 
 void ProcessObject::reap() const
@@ -127,7 +151,13 @@ std::shared_ptr<ProcessObject> spawn_child(const ChildLaunch &launch, uint32_t &
 	// The child may write to the terminal too, moving the cursor where this process cannot follow it.
 	TerminalConsole::instance().mark_stale();
 	char self[4096];
+#ifdef __APPLE__
+	const auto self_path = raven_self_exe().string();
+	const auto length = ssize_t(std::min(self_path.size(), sizeof(self) - 1));
+	std::memcpy(self, self_path.data(), size_t(length));
+#else
 	const auto length = ::readlink("/proc/self/exe", self, sizeof(self) - 1);
+#endif
 	if (length <= 0) {
 		error = 5;
 		return nullptr;
@@ -169,7 +199,7 @@ std::shared_ptr<ProcessObject> spawn_child(const ChildLaunch &launch, uint32_t &
 	};
 	if (!launch.environment.empty()) {
 		// The block travels in an anonymous file the child reads once and closes.
-		const int file = ::memfd_create("raven-environment", MFD_CLOEXEC);
+		const int file = blob_file("raven-environment");
 		if (file < 0) {
 			error = 8;
 			return nullptr;
@@ -208,7 +238,7 @@ std::shared_ptr<ProcessObject> spawn_child(const ChildLaunch &launch, uint32_t &
 		records.push_back(std::move(record));
 	}
 	if (!records.empty()) {
-		const int file = ::memfd_create("raven-handles", MFD_CLOEXEC);
+		const int file = blob_file("raven-handles");
 		const auto bytes = serialize_inherited(records);
 		if (file < 0 || ::write(file, bytes.data(), bytes.size()) != ssize_t(bytes.size())) {
 			if (file >= 0)
@@ -226,7 +256,7 @@ std::shared_ptr<ProcessObject> spawn_child(const ChildLaunch &launch, uint32_t &
 	// The runtime's messages in the child go where this runtime writes its own, apart from the program's standard error.
 	arguments.push_back("--diagnostics-fd=" + std::to_string(pass(2)));
 	// The child writes its exit code into a file both share.
-	const int exit_file = ::memfd_create("raven-exit", MFD_CLOEXEC);
+	const int exit_file = blob_file("raven-exit");
 	const int exit_kept = exit_file < 0 ? -1 : ::fcntl(exit_file, F_DUPFD_CLOEXEC, 0);
 	if (exit_kept >= 0) {
 		owned.push_back(exit_file);
@@ -289,6 +319,11 @@ std::shared_ptr<ProcessObject> spawn_child(const ChildLaunch &launch, uint32_t &
 		::close(descriptor);
 	release();
 	if (status) {
+		if (std::getenv("RAVEN_TRACE_API")) {
+			size_t bytes = 0;
+			for (auto &a : arguments) bytes += a.size() + 1;
+			fprintf(stderr, "raven: posix_spawn failed %d args=%zu bytes=%zu passes=%zu\n", status, arguments.size(), bytes, passes.size());
+		}
 		if (gate_pair[1] >= 0)
 			::close(gate_pair[1]);
 		if (channel_pair[0] >= 0)

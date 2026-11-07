@@ -164,9 +164,16 @@ inline int32_t draw_text(TextRenderer &renderer, Canvas &canvas, std::u16string_
 	std::optional<size_t> underline = std::nullopt, int32_t limit = INT32_MAX)
 {
 	const auto font = interface_font();
-	if (needs_fallback(text) && limit == INT32_MAX) {
-		const std::vector<uint16_t> units(text.begin(), text.end());
-		const auto width = text_width(renderer, text);
+	if (needs_fallback(text)) {
+		// Characters the interface face lacks (dashes, quotes) take the fallback faces; a limit shortens the text with an ellipsis.
+		std::u16string shown(text);
+		if (limit != INT32_MAX && text_width(renderer, shown) > limit) {
+			while (shown.size() > 1 && text_width(renderer, shown + u"...") > limit)
+				shown.pop_back();
+			shown += u"...";
+		}
+		const std::vector<uint16_t> units(shown.begin(), shown.end());
+		const auto width = text_width(renderer, shown);
 		const auto metrics = renderer.logical_metrics(font);
 		const uint32_t box_width = uint32_t(width + 2), box_height = uint32_t(metrics.height);
 		const auto coverage = renderer.render(font, units, box_width, box_height, 0, 0);

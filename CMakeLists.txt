@@ -1,8 +1,8 @@
 cmake_minimum_required(VERSION 3.20)
 project(Raven LANGUAGES C CXX)
 
-if(NOT CMAKE_SYSTEM_NAME STREQUAL "Linux")
-    message(FATAL_ERROR "The native Raven runtime currently requires Linux")
+if(NOT CMAKE_SYSTEM_NAME MATCHES "^(Linux|Darwin)$")
+    message(FATAL_ERROR "The native Raven runtime requires Linux or Darwin (ClokeOS)")
 endif()
 
 set(CMAKE_CXX_STANDARD 20)

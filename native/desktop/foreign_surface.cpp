@@ -426,7 +426,7 @@ bool take_foreign_frame(uint64_t window, uint32_t &seen, const std::function<voi
 		void *mapped = ::mmap(nullptr, size_t(status.st_size), PROT_READ, MAP_SHARED, file, 0);
 		if (mapped != MAP_FAILED) {
 			const auto *header = static_cast<const uint32_t *>(mapped);
-			const uint32_t sequence = std::atomic_ref<const uint32_t>(header[3]).load(std::memory_order_acquire);
+			const uint32_t sequence = __atomic_load_n(&header[3], __ATOMIC_ACQUIRE);
 			const uint32_t width = header[1], height = header[2];
 			if (header[0] == surface_magic && sequence && sequence != seen && width && height &&
 				header_size + size_t(width) * height * 4 <= size_t(status.st_size)) {

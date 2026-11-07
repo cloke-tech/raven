@@ -112,12 +112,12 @@ std::vector<uint8_t> scan_fonts()
 	std::error_code error;
 	std::vector<std::filesystem::path> roots;
 	try {
-		const auto installed = NativePrefix::from_environment().root() / "drive_c" / "windows" / "Fonts";
+		const auto installed = NativePrefix::from_environment().windows_directory() / "Fonts";
 		if (std::filesystem::is_directory(installed, error))
 			roots.push_back(installed);
 	} catch (const std::exception &) {}
 	// The fonts Raven bundles, such as the Raven Sans dialog faces, then the host's.
-	if (const auto bundled = std::filesystem::read_symlink("/proc/self/exe", error).parent_path() / "fonts"; std::filesystem::is_directory(bundled, error))
+	if (const auto bundled = raven_self_exe(error).parent_path() / "fonts"; std::filesystem::is_directory(bundled, error))
 		roots.push_back(bundled);
 #ifdef RAVEN_FONT_DIRECTORY
 	else if (std::filesystem::is_directory(RAVEN_FONT_DIRECTORY, error))

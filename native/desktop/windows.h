@@ -328,6 +328,7 @@ private:
 		DesktopRect caption, menu_bar, close, maximize, minimize, icon;
 	};
 	FrameLayout frame_layout(const DesktopWindow &window) const;
+	std::string global_menu_text(const DesktopWindow &window) const;
 	std::vector<DesktopRect> menu_bar_items(const DesktopWindow &window);
 	void paint_nonclient(uint64_t window);
 	void paint_modern_frame(uint64_t handle,const DesktopWindow &window,const FrameLayout &layout,paint::Canvas &canvas,bool is_active,int32_t width,

@@ -89,6 +89,14 @@ struct DesktopPresentation {
 	// Keeps a top-level window above the top-level window that owns it, as Windows keeps an owned dialog; 0 for no owner. Given before the
 	// window's first frame.
 	std::function<void(uint64_t handle,uint64_t owner)> transient_for;
+	// ClokeOS: the window manager draws the title bar and the frame. The backend asks (left, top, right, bottom) for the part of a window's
+	// frame the host window leaves out: the frame of a window with a caption is cut off from its pixels and its coordinates, so the host window
+	// shows the client area and the menu bar. The fifth value is the window's style, for the buttons of the title bar. The window system calls this once; no provider, or zeros, keep the whole frame.
+	std::function<void(std::function<std::array<int32_t,5>(uint64_t)>)> frame_insets;
+	// ClokeOS: the menu of a window with a caption shows in the global menu bar. The backend asks for its text (lines "<depth>\t<kind>\t<number>
+	// \t<flags>\t<label>\t<key>", kind m submenu, i item, s separator, flags d disabled, c checked, r radio) and sends the chosen number back as a
+	// WM_COMMAND event of the window. The text is empty without a menu.
+	std::function<void(std::function<std::string(uint64_t)>)> menu_text;
 };
 
 }

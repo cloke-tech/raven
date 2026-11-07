@@ -160,7 +160,7 @@ std::optional<std::filesystem::path> NativePaths::drive_root(char16_t letter) co
 		return std::nullopt;
 	if (letter == u'z')
 		return std::filesystem::path("/");
-	auto root = prefix.root() / (std::string("drive_") + char(letter));
+	auto root = letter == u'c' ? prefix.c_drive() : prefix.drive_directory(char(letter));
 	std::error_code ignored;
 	if (letter != u'c' && !std::filesystem::is_directory(root, ignored))
 		return std::nullopt;
@@ -409,9 +409,23 @@ std::u16string NativePaths::user_name() const
 std::u16string NativePaths::user_profile() const
 {
 	const auto profile = u"C:\\Users\\" + user_name();
-	for (const auto *part : {u"", u"\\AppData\\Roaming", u"\\AppData\\Local\\Temp", u"\\Documents", u"\\Desktop"})
+	for (const auto *part : {u"", u"\\AppData\\Roaming", u"\\AppData\\Local\\Temp"})
 		if (const auto resolved = resolve(profile + part))
 			std::filesystem::create_directories(resolved->host);
+	// The user's folders of the same names are the user's own folders on the host: C:\Users\<name>\Documents is ~/Documents.
+	const char *home = std::getenv("HOME");
+	for (const auto &[windows_name, host_name] : {std::pair{u"\\Documents", "Documents"}, std::pair{u"\\Desktop", "Desktop"}, std::pair{u"\\Downloads", "Downloads"},
+			std::pair{u"\\Pictures", "Pictures"}, std::pair{u"\\Music", "Music"}, std::pair{u"\\Videos", "Movies"}})
+		if (const auto resolved = resolve(profile + windows_name)) {
+			std::error_code error;
+			if (std::filesystem::symlink_status(resolved->host, error).type() != std::filesystem::file_type::not_found)
+				continue;
+			const auto target = home && *home ? std::filesystem::path(home) / host_name : std::filesystem::path();
+			if (!target.empty() && std::filesystem::is_directory(target, error))
+				std::filesystem::create_directory_symlink(target, resolved->host, error);
+			else
+				std::filesystem::create_directories(resolved->host, error);
+		}
 	return profile;
 }
 

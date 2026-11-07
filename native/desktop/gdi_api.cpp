@@ -497,6 +497,19 @@ void NativeDesktop::register_gdi_api(ApiRegistry &registry)
 			call.ret(take);
 		});
 	});
+	// ResizePalette(palette, entries): new entries are black; SetPaletteEntries(palette, first, count, entries): the entries that fit.
+	registry.add("ResizePalette", 2, [=, this](ApiCall &call) {
+		guarded(call, 0, [&] {
+			auto *palette = objects.palette(call[0]);
+			const uint32_t count = call.u32(1);
+			if (!palette)
+				throw uint32_t(6);
+			if (!count || count > 1024)
+				throw uint32_t(87);
+			palette->entries.resize(count, 0);
+			call.ret(1);
+		});
+	});
 	registry.add("GetNearestPaletteIndex", 2, [=, this](ApiCall &call) {
 		guarded(call, clr_invalid, [&] {
 			const auto *palette = objects.palette(call[0]);
@@ -517,9 +530,22 @@ void NativeDesktop::register_gdi_api(ApiRegistry &registry)
 			call.ret(best);
 		});
 	});
+	// RealizePalette: the palette selected into a context becomes the colour table of the indexed DIB section selected in it, which is
+	// how a program that creates its section with an empty table (Delphi's bitmaps) gets its colours.
 	registry.add("RealizePalette", 1, [=, this](ApiCall &call) {
 		guarded(call, 0, [&] {
-			require_dc(call, 0);
+			auto &dc = require_dc(call, 0);
+			const auto *palette = dc.palette ? objects.palette(dc.palette) : nullptr;
+			auto *bitmap = objects.bitmap(dc.bitmap);
+			if (std::getenv("RAVEN_TRACE_FAIL") && bitmap && bitmap->depth <= 8)
+				std::fprintf(stderr, "realize dc=%llx palette=%llx entries=%zu dib=%d depth=%u\n", (unsigned long long)call[0], (unsigned long long)dc.palette, palette ? palette->entries.size() : size_t(0), bitmap->dib_section ? 1 : 0, unsigned(bitmap->depth));
+			if (palette && bitmap && bitmap->dib_section && bitmap->depth <= 8) {
+				bitmap->palette.assign(size_t(1) << bitmap->depth, 0);
+				for (size_t i = 0; i < bitmap->palette.size() && i < palette->entries.size(); ++i)
+					bitmap->palette[i] = palette->entries[i];
+				call.ret(palette->entries.size());
+				return;
+			}
 			call.ret(0);
 		});
 	});
@@ -534,8 +560,12 @@ void NativeDesktop::register_gdi_api(ApiRegistry &registry)
 		});
 	registry.add("SelectPalette", 3, [=, this](ApiCall &call) {
 		guarded(call, 0, [&] {
-			require_dc(call, 0);
-			call.ret(0);
+			auto &dc = require_dc(call, 0);
+			if (call[1] && !objects.palette(call[1]))
+				throw uint32_t(6);
+			const auto previous = dc.palette;
+			dc.palette = call[1];
+			call.ret(previous);
 		});
 	});
 	registry.add("GetPixel", 3, [=, this](ApiCall &call) {
@@ -1355,6 +1385,12 @@ void NativeDesktop::register_gdi_api(ApiRegistry &registry)
 				throw uint32_t(handle > 0 && handle <= 32 ? 120 : 6);
 			Painter painter(objects, dc);
 			painter.fill(rect.left, rect.top, rect.right, rect.bottom, *brush);
+			if (std::getenv("RAVEN_TRACE_FILL")) {
+				const auto *target = objects.bitmap(dc.bitmap);
+				std::fprintf(stderr, "fill dc=%llx window=%llx rect=%d,%d,%d,%d origin=%d,%d color=%06x hollow=%d changed=%d bitmap=%ux%u\n", (unsigned long long)call[0], (unsigned long long)dc.window,
+					int(rect.left), int(rect.top), int(rect.right), int(rect.bottom), int(dc.origin_x), int(dc.origin_y), unsigned(brush->color), brush->hollow ? 1 : 0, painter.changed() ? 1 : 0,
+					target ? unsigned(target->width) : 0U, target ? unsigned(target->height) : 0U);
+			}
 			if (painter.changed())
 				touched(dc);
 			call.ret(1);
@@ -1610,10 +1646,42 @@ void NativeDesktop::register_gdi_api(ApiRegistry &registry)
 				call.store<uint16_t>(call[5] + 14, uint16_t(format));
 				call.store<uint32_t>(call[5] + 16, 0);
 				call.store<uint32_t>(call[5] + 20, uint32_t(((size_t(bitmap->width) * format + 31) / 32) * 4 * bitmap->height));
+				if (std::getenv("RAVEN_TRACE_FAIL")) {
+					std::fprintf(stderr, "getdibits query bitmap=%llx %ux%u depth=%u dib=%d palette=%zu:", (unsigned long long)call[1], unsigned(bitmap->width), unsigned(bitmap->height), unsigned(bitmap->depth), bitmap->dib_section ? 1 : 0, bitmap->palette.size());
+					for (size_t i = 0; i < std::min<size_t>(6, bitmap->palette.size()); ++i) std::fprintf(stderr, " %06x", unsigned(bitmap->palette[i]));
+					std::fprintf(stderr, "\n");
+				}
+				// An indexed bitmap hands its colour table back with the format (programs build a copy of the bitmap from it).
+				if (format <= 8 && !bitmap->palette.empty() && header_size == 40) {
+					std::vector<uint8_t> table((size_t(1) << format) * 4);
+					for (size_t entry = 0; entry < (size_t(1) << format) && entry < bitmap->palette.size(); ++entry) {
+						const uint32_t color = bitmap->palette[entry];
+						table[entry * 4] = uint8_t(color_blue(color)); table[entry * 4 + 1] = uint8_t(color_green(color)); table[entry * 4 + 2] = uint8_t(color_red(color));
+					}
+					call.write(call[5] + header_size, table);
+				}
 				call.ret(1);
 				return;
 			}
 			if (!call[4]) {
+				// Without a buffer the call still fills the colour table of an indexed format: the bitmap's own colours when it has that depth.
+				if (bit_count <= 8 && header_size == 40) {
+					const uint32_t entries = 1u << bit_count;
+					const bool own = bit_count == bitmap->depth && !bitmap->palette.empty();
+					if (std::getenv("RAVEN_TRACE_FAIL"))
+						std::fprintf(stderr, "getdibits table bitmap=%llx depth=%u own=%d first=%06x\n", (unsigned long long)call[1], unsigned(bitmap->depth), own ? 1 : 0, own ? unsigned(bitmap->palette[0]) : 0U);
+					std::vector<uint8_t> table(entries * 4);
+					for (uint32_t entry = 0; entry < entries; ++entry) {
+						if (own) {
+							const uint32_t color = entry < bitmap->palette.size() ? bitmap->palette[entry] : 0;
+							table[entry * 4] = uint8_t(color_blue(color)); table[entry * 4 + 1] = uint8_t(color_green(color)); table[entry * 4 + 2] = uint8_t(color_red(color));
+						} else {
+							const uint8_t level = bit_count == 1 ? (entry ? 255 : 0) : uint8_t(entry * 255 / (entries - 1));
+							table[entry * 4] = table[entry * 4 + 1] = table[entry * 4 + 2] = level;
+						}
+					}
+					call.write(call[5] + header_size, table);
+				}
 				call.ret(1);
 				return;
 			}

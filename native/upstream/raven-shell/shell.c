@@ -1656,3 +1656,31 @@ BOOL WINAPI DllMain(HINSTANCE instance, DWORD reason, LPVOID reserved)
 {
 	return TRUE;
 }
+
+/* SHGetImageList: the system image lists as comctl32 image lists of the sizes the shell uses (large, small, extra large, small again,
+ * jumbo), empty until a program adds to them; the interface comes from the image list itself. Programs that ask for it (Inno Setup's
+ * folder tree) refuse to go on without one. */
+HRESULT WINAPI SHGetImageList(int which, REFIID iid, void **out)
+{
+	static const int sizes[5] = {32, 16, 48, 16, 256};
+	static HIMAGELIST lists[5];
+	typedef HIMAGELIST (WINAPI *create_type)(int, int, UINT, int, int);
+	typedef HRESULT (WINAPI *query_type)(HIMAGELIST, REFIID, void **);
+	if (!out)
+		return E_INVALIDARG;
+	*out = NULL;
+	if (which < 0 || which > 4)
+		return E_INVALIDARG;
+	HMODULE controls = LoadLibraryW(L"comctl32.dll");
+	if (!controls)
+		return E_FAIL;
+	create_type create = (create_type)GetProcAddress(controls, "ImageList_Create");
+	query_type query = (query_type)GetProcAddress(controls, "HIMAGELIST_QueryInterface");
+	if (!create || !query)
+		return E_NOINTERFACE;
+	if (!lists[which])
+		lists[which] = create(sizes[which], sizes[which], 0x21 /* ILC_COLOR32 | ILC_MASK */, 8, 8);
+	if (!lists[which])
+		return E_OUTOFMEMORY;
+	return query(lists[which], iid, out);
+}

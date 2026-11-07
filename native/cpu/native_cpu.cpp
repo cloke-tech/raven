@@ -12,7 +12,9 @@
 #include <cstring>
 #include <iostream>
 #include <sstream>
+#ifndef __APPLE__
 #include <elf.h>
+#endif
 #include <fcntl.h>
 #include <functional>
 #include <csignal>
@@ -29,6 +31,9 @@
 #include <sys/mman.h>
 #include <sys/eventfd.h>
 #include <sys/socket.h>
+#ifdef __APPLE__
+#include "platform/mach_guest.h"
+#else
 #include <linux/audit.h>
 #include <linux/filter.h>
 #include <linux/seccomp.h>
@@ -36,6 +41,8 @@
 #include <sys/ptrace.h>
 #include <sys/syscall.h>
 #include <sys/user.h>
+#define RAVEN_DEBUGREG_OFFSET offsetof(struct user, u_debugreg)
+#endif
 #include <sys/uio.h>
 #include <sys/wait.h>
 #include <thread>
@@ -81,6 +88,7 @@ static void trace(enum __ptrace_request operation, pid_t child, void *data = nul
 	}
 }
 
+#ifndef __APPLE__
 class NativeChild {
 public:
 	NativeChild(std::span<const int> image_fds, const std::string &bootstrap, std::chrono::milliseconds timeout);
@@ -512,6 +520,8 @@ uint64_t NativeChild::syscall(uint64_t number, uint64_t a1, uint64_t a2, uint64_
 	return registers.rax;
 }
 
+#endif // !__APPLE__
+
 struct NativeProcess::State {
 	std::unique_ptr<NativeChild> child;
 	pid_t memory_task = 0;
@@ -741,6 +751,13 @@ NativeProcess::~NativeProcess()
 		std::cerr << "profile: queued calls=" << state->queued_calls << '\n';
 }
 
+#ifdef __APPLE__
+void NativeProcess::install_seccomp()
+{
+	throw std::runtime_error("the native guest sandbox (seccomp) is not available on ClokeOS");
+}
+
+#else
 void NativeProcess::install_seccomp()
 {
 	auto &child = *state->child;
@@ -774,6 +791,8 @@ void NativeProcess::install_seccomp()
 	trace(PTRACE_SETOPTIONS, child.pid, reinterpret_cast<void *>(PTRACE_O_EXITKILL | PTRACE_O_TRACESYSGOOD | PTRACE_O_TRACESECCOMP));
 	state->seccomp = true;
 }
+
+#endif
 
 NativeContext NativeProcess::context() const
 {
@@ -939,6 +958,10 @@ uint64_t NativeProcess::memory_syscall(uint64_t number, uint64_t a1, uint64_t a2
 	try {
 		result = child.syscall(number, a1, a2, a3, a4, a5, a6);
 	} catch (...) {
+#ifdef __APPLE__
+		// the memory operations are made through Mach calls here: the guest's registers were not touched, the error is the real one
+		throw;
+#endif
 		try {
 			user_regs_struct where{};
 			if (child.pid != -1)
@@ -970,6 +993,9 @@ static void memory_range(uint64_t address, size_t size, int protection, uint64_t
 
 // MAP_32BIT only reaches the 1 GiB window that also holds the images, so 32-bit allocations take the lowest free 64 KiB aligned gap
 // of the child's own address space and are then mapped there without replacing anything.
+#ifdef __APPLE__
+static uint64_t low_gap(pid_t pid, uint64_t size, uint64_t limit) { return raven_low_gap(pid, size, limit); }
+#else
 static uint64_t low_gap(pid_t pid, uint64_t size, uint64_t limit)
 {
 	std::ifstream maps("/proc/" + std::to_string(pid) + "/maps");
@@ -988,6 +1014,8 @@ static uint64_t low_gap(pid_t pid, uint64_t size, uint64_t limit)
 	}
 	return candidate < limit && limit - candidate >= size ? candidate : 0;
 }
+
+#endif
 
 uint64_t NativeProcess::map_memory(size_t size, int protection, uint64_t address)
 {
@@ -1415,7 +1443,7 @@ void NativeProcess::watch_write(uint64_t address)
 	state->require_stopped();
 	const pid_t pid = state->child->pid;
 	const auto poke = [&](size_t index, uint64_t value) {
-		const long offset = long(offsetof(struct user, u_debugreg)) + long(index * sizeof(unsigned long));
+		const long offset = long(RAVEN_DEBUGREG_OFFSET) + long(index * sizeof(unsigned long));
 		if (ptrace(PTRACE_POKEUSER, pid, reinterpret_cast<void *>(offset), reinterpret_cast<void *>(value)) == -1)
 			throw std::runtime_error("cannot program the debug registers");
 	};
@@ -1754,6 +1782,11 @@ NativeResult NativeProcess::begin_call(uint64_t address, std::span<const uint64_
 		throw std::runtime_error("native call exceeds initial argument limit");
 	if (!state->covers(address, 1, PROT_EXEC))
 		throw std::runtime_error("native entry is outside executable image memory");
+	if (std::getenv("RAVEN_TRACE_STOPS")) {
+		std::fprintf(stderr, "raven: call %llx args:", (unsigned long long)address);
+		for (auto argument : arguments) std::fprintf(stderr, " %llx", (unsigned long long)argument);
+		std::fprintf(stderr, "\n");
+	}
 	state->child->set_timeout(timeout);
 	if (state->mode == NativeMode::x86)
 		return begin_x86_call(address, arguments, stack_ceiling, timeout);
@@ -2032,7 +2065,7 @@ NativeResult NativeProcess::resume(std::chrono::milliseconds timeout)
 	state->debug_print_fault=signal==SIGSEGV && info.si_code==SI_KERNEL && registers.rax==1;
 	if (signal == SIGTRAP && info.si_code == TRAP_HWBKPT) {
 		// Reading the stop reason is enough; DR6 must be cleared or the next trap reports a stale cause.
-		ptrace(PTRACE_POKEUSER, child.pid, reinterpret_cast<void *>(offsetof(struct user, u_debugreg) + 6 * sizeof(unsigned long)), nullptr);
+		ptrace(PTRACE_POKEUSER, child.pid, reinterpret_cast<void *>(RAVEN_DEBUGREG_OFFSET + 6 * sizeof(unsigned long)), nullptr);
 	}
 	const bool breakpoint = signal == SIGTRAP && (info.si_code == TRAP_BRKPT || info.si_code == SI_KERNEL);
 	if (breakpoint && registers.rip == (x86 ? state->return_gate : child.gate) + 1) {

@@ -12,8 +12,14 @@
 #include <memory>
 #include <mutex>
 #include <optional>
+#ifdef __APPLE__
+#include "platform/context_darwin.h"
+#else
 #include <ucontext.h>
+#endif
 #include <poll.h>
+#include <stdexcept>
+#include <string>
 #include <vector>
 
 namespace raven {
@@ -27,7 +33,11 @@ struct GuestThread {
 	uint64_t teb = 0, stack_low = 0, stack_high = 0;
 	State state = State::ready;
 	NativeThreadState snapshot;
+#ifdef __APPLE__
+	RavenContext context{};
+#else
 	ucontext_t context{};
+#endif
 	std::unique_ptr<char[]> host_stack;
 	// Wait condition: pure check, evaluated by the scheduler; the thread resumes when it holds or the wake time passes.
 	std::function<bool()> ready;
@@ -86,6 +96,55 @@ private:
 
 struct ThreadExit {
 	uint32_t code;
+};
+
+// The error that ended a non-main thread, carried to the main thread. std::exception_ptr is not used: PureDarwin's libc++ has none that works
+// (every use aborts), so the exception types that occur here are kept by value.
+class PendingError {
+public:
+	PendingError() = default;
+	PendingError(std::nullptr_t) {}
+	explicit operator bool() const { return kind != Kind::none; }
+	PendingError &operator=(std::nullptr_t)
+	{
+		kind = Kind::none;
+		return *this;
+	}
+	// Called inside a catch handler: records the exception being handled.
+	static PendingError capture()
+	{
+		PendingError error;
+		try {
+			throw;
+		} catch (const NativeResult &result) {
+			error.kind = Kind::result;
+			error.result = result;
+		} catch (const ThreadExit &exit) {
+			error.kind = Kind::exit;
+			error.code = exit.code;
+		} catch (const std::exception &failure) {
+			error.kind = Kind::failure;
+			error.message = failure.what();
+		} catch (...) {
+			error.kind = Kind::failure;
+			error.message = "unknown exception";
+		}
+		return error;
+	}
+	[[noreturn]] void rethrow() const
+	{
+		if (kind == Kind::result)
+			throw result;
+		if (kind == Kind::exit)
+			throw ThreadExit{code};
+		throw std::runtime_error(message);
+	}
+
+private:
+	enum class Kind { none, result, exit, failure } kind = Kind::none;
+	NativeResult result{};
+	uint32_t code = 0;
+	std::string message;
 };
 
 // Cooperative scheduler over one traced process: guest threads switch only inside API calls.
@@ -172,7 +231,7 @@ private:
 	bool tearing_down = false;
 	uint32_t next_id = 2;
 	// An exception from a non-main thread is carried to the main thread, which owns the process result.
-	std::exception_ptr pending;
+	PendingError pending;
 	std::shared_ptr<GuestThread> pick(bool include_current);
 	void schedule();
 	void switch_to(GuestThread &next);

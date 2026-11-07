@@ -459,7 +459,8 @@ uint32_t ec_magic(Kind kind, const std::string &group, bool private_key, bool ge
 		                          : (private_key ? magic_ecdsa_private_generic : magic_ecdsa_public_generic);
 	const uint32_t index = group == "prime256v1" ? 1 : group == "secp384r1" ? 3 : 5;
 	const uint32_t base = kind == Kind::ecdh ? 0x304b4345 : 0x30534345; // ECK0, ECS0
-	return base + index + (private_key ? 1 : 0);
+	// the digit is the fourth byte of the magic ("ECK1", "ECS2"), not its lowest
+	return base + ((index + (private_key ? 1 : 0)) << 24);
 }
 
 EVP_PKEY *rsa_key(const std::vector<uint8_t> &blob, bool private_key)

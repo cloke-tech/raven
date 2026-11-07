@@ -399,7 +399,7 @@ X509_STORE *trust_anchors()
 			if (X509_STORE_load_file(created, path))
 				break;
 		std::error_code error;
-		const auto roots = std::filesystem::read_symlink("/proc/self/exe", error).parent_path() / "roots";
+		const auto roots = raven_self_exe(error).parent_path() / "roots";
 		for (const auto &entry : std::filesystem::directory_iterator(roots, error)) {
 			std::ifstream input(entry.path(), std::ios::binary);
 			const std::string bytes((std::istreambuf_iterator<char>(input)), std::istreambuf_iterator<char>());

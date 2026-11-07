@@ -72,6 +72,9 @@ uint64_t filetime_now()
 // CPU time a running child has used so far, in nanoseconds; 0 once the host no longer lists it.
 static uint64_t child_cpu_nanoseconds(pid_t pid)
 {
+#ifdef __APPLE__
+	return raven_process(pid).cpu_ns;
+#endif
 	std::ifstream stat("/proc/" + std::to_string(pid) + "/stat");
 	std::string text;
 	std::getline(stat, text);
@@ -586,6 +589,19 @@ void register_process_info_api(ApiRegistry &registry, KernelContext &context)
 		if (call[2])
 			call.store<uint16_t>(call[2], 0x8664);
 		call.ret(1);
+	});
+	// Als Gast laeuft nur x86 (WOW64); alles andere ist nicht unterstuetzt
+	registry.add("IsWow64GuestMachineSupported", 2, [](ApiCall &call) {
+		if (!call[1]) {
+			call.ret(0x80070057U);
+			return;
+		}
+		call.store<uint32_t>(call[1], uint16_t(call.u32(0)) == 0x14c ? 1 : 0);
+		call.ret(0);
+	});
+	// IsEqualGUID(a, b): whether two 16-byte identifiers match (a null pointer matches nothing).
+	registry.add("IsEqualGUID", 2, [](ApiCall &call) {
+		call.ret(call[0] && call[1] && call.read(call[0], 16) == call.read(call[1], 16) ? 1 : 0);
 	});
 	// The machine runs x64 programs in user and kernel mode and 32-bit x86 ones in the WOW64 container; nothing else.
 	registry.add("GetMachineTypeAttributes", 2, [](ApiCall &call) {

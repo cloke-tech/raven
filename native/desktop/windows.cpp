@@ -73,9 +73,62 @@ void NativeWindows::set_call(std::function<NativeResult(uint64_t,std::span<const
 	invoke=std::move(caller);
 }
 
+// The menu of a window as the lines CloakServer's global menu bar reads: "<depth>\t<kind>\t<number>\t<flags>\t<label>\t<key>".
+std::string NativeWindows::global_menu_text(const DesktopWindow &window) const
+{
+	std::string out;
+	const auto *top=std::as_const(objects).menu(window.menu);
+	if (!top || top->items.empty())
+		return out;
+	const std::function<void(const DesktopMenu &,int,int)> walk=[&](const DesktopMenu &menu,int depth,int guard) {
+		if (guard > 8)
+			return;
+		for (const auto &item : menu.items) {
+			const bool separator=item.type & 0x800U;
+			const auto *sub=item.submenu ? std::as_const(objects).menu(item.submenu) : nullptr;
+			std::u16string label,key;
+			if (!separator) {
+				// "&" marks a mnemonic, a tab starts the accelerator text.
+				std::u16string text;
+				for (size_t index=0;index<item.text.size();++index) {
+					if (item.text[index]==u'&' && index+1<item.text.size()) ++index;
+					text.push_back(item.text[index]);
+				}
+				const auto tab=text.find(u'\t');
+				label=text.substr(0,tab);
+				if (tab!=text.npos) key=text.substr(tab+1);
+			}
+			std::string flags;
+			if (item.state & 3U) flags+='d';
+			if (item.state & 8U) flags+='c';
+			if (item.type & 0x200U) flags+='r';
+			out+=std::to_string(depth)+'\t'+(separator ? 's' : sub ? 'm' : 'i')+'\t'+std::to_string(sub ? 0U : item.id)+'\t'+flags+'\t'+encode_utf8(label,true)+'\t'+encode_utf8(key,true)+'\n';
+			if (sub)
+				walk(*sub,depth+1,guard+1);
+		}
+	};
+	walk(*top,0,0);
+	return out;
+}
+
 void NativeWindows::set_presentation(DesktopPresentation backend)
 {
 	presentation=std::move(backend);
+	// The window manager frames windows that have a caption: the backend cuts the frame off (caption and border) and keeps the menu bar.
+	if (presentation.frame_insets)
+		presentation.frame_insets([this](uint64_t handle) -> std::array<int32_t,5> {
+			const auto *window=std::as_const(objects).window(handle);
+			if (!window || (window->style & 0xc00000U)!=0xc00000U || window->glass || window->own_frame) return {0,0,0,0,0};
+			const auto layout=frame_layout(*window);
+			// The menu of the window shows in the global menu bar, so its bar leaves the window.
+			const int32_t menu=!global_menu_text(*window).empty() ? layout.menu_height : 0;
+			return {layout.border,layout.border+layout.caption_height+menu,layout.border,layout.border,int32_t(window->style)};
+		});
+	if (presentation.menu_text)
+		presentation.menu_text([this](uint64_t handle) -> std::string {
+			const auto *window=std::as_const(objects).window(handle);
+			return window ? global_menu_text(*window) : std::string();
+		});
 	refresh_screen();
 	if (presentation.poll) {
 		auto poll=presentation.poll;
@@ -190,6 +243,12 @@ void NativeWindows::present(uint64_t handle, bool force)
 	handle=objects.window_root(handle);
 	if (!handle) throw uint32_t(1400);
 	dirty_roots.erase(handle);
+	if (std::getenv("RAVEN_TRACE_PRESENT")) {
+		const auto *traced=std::as_const(objects).window(handle);
+		std::fprintf(stderr,"present %llx force=%d display=%d",(unsigned long long)handle,force?1:0,presentation.present?1:0);
+		if (traced) std::fprintf(stderr," outer=%d,%d,%d,%d painted=%d updates=%d",int(traced->outer.left),int(traced->outer.top),int(traced->outer.right),int(traced->outer.bottom),traced->painted?1:0,traced->update.empty()?0:1);
+		std::fprintf(stderr,"\n");
+	}
 	// Without a display the frame has nowhere to go and is dropped; the window lives on as on a screen that is switched off.
 	if (!presentation.present) return;
 	// A window without area shows nothing, as on Windows. Office sizes the shadows of its dialogs and menus only through

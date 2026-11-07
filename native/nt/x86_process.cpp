@@ -754,6 +754,8 @@ NativeResult run_native_process_x86(ModuleSet &modules, PEModule &entry,
 		images.push_back(&module->loaded);
 	const auto deadline = std::chrono::steady_clock::now() + timeout;
 	NativeProcess process(images, bootstrap, timeout, NativeMode::x86, entry.image.stack_reserve);
+	// MulDiv runs in the guest (the provider holds its code at the export), so no breakpoint stands at its address.
+	std::erase_if(traps, [](const auto &trap) { return trap.second.first == "MulDiv"; });
 	for (const auto &[address, api] : traps)
 		process.add_api_trap(address, api.second);
 	NativeEnvironment environment(process, entry.loaded.base(), uint32_t(::getpid()), 1);

@@ -10,17 +10,62 @@
 
 namespace raven {
 
+std::filesystem::path NativePrefix::c_drive() const
+{
+	if (const char *chosen = std::getenv("RAVEN_C_DRIVE"); chosen && *chosen)
+		return chosen;
+	// ClokeOS ships /NT, the Windows tree of the system that every user shares (Users/<name> is each user's own folder).
+	std::error_code error;
+	if (std::filesystem::is_directory("/NT", error))
+		return "/NT";
+	return directory / "NT";
+}
+
+std::filesystem::path NativePrefix::drive_directory(char letter) const
+{
+	return directory / "Volumes" / std::string(1, char(std::toupper(static_cast<unsigned char>(letter))));
+}
+
 NativePrefix::NativePrefix(std::filesystem::path root) : directory(std::move(root))
 {
 	if (directory.empty())
 		throw std::runtime_error("native prefix requires a directory");
+	// A prefix made before the folders were named like NT: drive_c becomes NT, windows becomes Windows, drive_<x> becomes Volumes/<X>.
+	{
+		std::error_code error;
+		const auto old_c = directory / "drive_c";
+		if (std::filesystem::is_directory(old_c, error) && !std::filesystem::exists(c_drive(), error)) {
+			std::filesystem::create_directories(c_drive().parent_path(), error);
+			std::filesystem::rename(old_c, c_drive(), error);
+			if (!error && std::filesystem::is_directory(c_drive() / "windows", error) && !std::filesystem::exists(c_drive() / "Windows", error))
+				std::filesystem::rename(c_drive() / "windows", c_drive() / "Windows", error);
+		}
+		for (char letter = 'a'; letter <= 'z'; ++letter) {
+			const auto old_drive = directory / (std::string("drive_") + letter);
+			if (letter != 'c' && std::filesystem::is_directory(old_drive, error) && !std::filesystem::exists(drive_directory(letter), error)) {
+				std::filesystem::create_directories(directory / "Volumes", error);
+				std::filesystem::rename(old_drive, drive_directory(letter), error);
+			}
+		}
+	}
 	// The folders every Windows installation has, so that programs can put files in the places they expect.
-	for (const char *folder : {"windows", "windows/system32", "windows/syswow64", "Program Files/Common Files", "Program Files (x86)/Common Files",
+	for (const char *folder : {"Windows", "Windows/system32", "Windows/syswow64", "Program Files/Common Files", "Program Files (x86)/Common Files",
 			"ProgramData/Microsoft/Windows/Start Menu/Programs",
 			"Users/Public/Desktop", "Users/Public/Documents"})
-		std::filesystem::create_directories(directory / "drive_c" / folder);
+	{
+		// Folders of a tree the users share are open to their group: whoever creates one makes it for everybody (Users/<name> stays the user's).
+		std::error_code error;
+		auto path = c_drive();
+		std::filesystem::create_directories(path, error);
+		const std::filesystem::path relative(folder);
+		for (const auto &part : relative) {
+			path /= part;
+			if (std::filesystem::create_directory(path, error))
+				std::filesystem::permissions(path, std::filesystem::perms::owner_all | std::filesystem::perms::group_all | std::filesystem::perms::others_read | std::filesystem::perms::others_exec, error);
+		}
+	}
 	// The Fonts folder holds the installed fonts, as on Windows: links to the host's font files, made once when the folder is new.
-	const auto fonts = directory / "drive_c" / "windows" / "Fonts";
+	const auto fonts = windows_directory() / "Fonts";
 	std::error_code error;
 	if (std::filesystem::create_directory(fonts, error)) {
 		std::vector<std::filesystem::path> roots{"/usr/share/fonts", "/usr/local/share/fonts"};
@@ -42,7 +87,7 @@ void NativePrefix::place_runtime_components(const std::filesystem::path &runtime
 {
 	// The loader takes these libraries from beside the runtime whatever the prefix holds: the copies only answer programs that search for,
 	// read or hash them. A newer runtime refreshes them.
-	const auto windows = directory / "drive_c" / "windows";
+	const auto windows = windows_directory();
 	for (const auto &[source, folder] : {std::pair{runtime, "system32"}, std::pair{runtime / "x86", "syswow64"}})
 		for (const auto name : runtime_components) {
 			std::error_code error;
@@ -92,12 +137,12 @@ std::optional<std::filesystem::path> NativePrefix::resolve(std::string_view wind
 	for (auto &character : text)
 		if (character == '\\')
 			character = '/';
-	std::filesystem::path base = directory / "drive_c" / "windows";
+	std::filesystem::path base = windows_directory();
 	if (text.size() >= 2 && text[1] == ':') {
 		const char drive = char(text[0] | 0x20);
 		if (drive < 'a' || drive > 'z')
 			return std::nullopt;
-		base = directory / (std::string("drive_") + drive);
+		base = drive == 'c' ? c_drive() : drive_directory(drive);
 		text.erase(0, 2);
 	}
 	if (!text.empty() && text[0] == '/')

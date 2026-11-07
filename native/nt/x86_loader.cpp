@@ -52,7 +52,7 @@ std::optional<std::vector<uint8_t>> NativeX86Loader::read_library(const std::str
 {
 	// The runtime's own components come from beside it, in their 32-bit builds.
 	if (std::find(std::begin(runtime_components), std::end(runtime_components), name) != std::end(runtime_components)) {
-		const auto component = std::filesystem::read_symlink("/proc/self/exe").parent_path() / "x86" / name;
+		const auto component = raven_self_exe().parent_path() / "x86" / name;
 		if (std::filesystem::exists(component)) {
 			identity = name;
 			return read_all(component);
@@ -60,7 +60,7 @@ std::optional<std::vector<uint8_t>> NativeX86Loader::read_library(const std::str
 	}
 	// The C runtime comes from the runtime's own directory, in its 32-bit build.
 	if (name == "ucrtbase.dll") {
-		const auto component = std::filesystem::read_symlink("/proc/self/exe").parent_path() / "ucrtbase32.dll";
+		const auto component = raven_self_exe().parent_path() / "ucrtbase32.dll";
 		if (!std::filesystem::exists(component))
 			return std::nullopt;
 		identity = name;
@@ -81,7 +81,7 @@ std::optional<std::vector<uint8_t>> NativeX86Loader::read_library(const std::str
 	if (!resolved || !resolved->exists || !std::filesystem::is_regular_file(resolved->host)) {
 		// The common controls component stands in for comctl32.dll however late the program loads it.
 		if (name == "comctl32.dll") {
-			const auto component = std::filesystem::read_symlink("/proc/self/exe").parent_path() / "x86" / name;
+			const auto component = raven_self_exe().parent_path() / "x86" / name;
 			if (std::filesystem::exists(component)) {
 				identity = name;
 				file = component;
@@ -93,7 +93,7 @@ std::optional<std::vector<uint8_t>> NativeX86Loader::read_library(const std::str
 			std::vector<std::filesystem::path> places;
 			if (const char *directory = std::getenv("RAVEN_D3D_DIRECTORY"))
 				places.push_back(std::filesystem::path(directory) / name);
-			places.push_back(std::filesystem::read_symlink("/proc/self/exe").parent_path() / "x86" / "raven-d3d10_1.dll");
+			places.push_back(raven_self_exe().parent_path() / "x86" / "raven-d3d10_1.dll");
 			for (const auto &place : places)
 				if (std::filesystem::exists(place)) {
 					identity = name;

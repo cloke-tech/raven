@@ -1,4 +1,7 @@
 #include "loaded_image.h"
+#ifdef __APPLE__
+#include "platform/mach_guest.h"
+#endif
 
 #include <algorithm>
 #include <cerrno>
@@ -33,6 +36,13 @@ LoadedImage::LoadedImage(const PEImage &image, uint64_t base, bool relocated)
 			throw std::system_error(errno, std::generic_category(), "size PE backing file");
 		// The contents go in through the descriptor: copying them through the mapping took a page fault for every page of a library
 		// of hundreds of megabytes, in every process that loads it.
+#ifdef __APPLE__
+		// POSIX shared memory objects take no pwrite: the contents go through the mapping
+		void *mapping = mmap(nullptr, size, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
+		if (mapping == MAP_FAILED)
+			throw std::system_error(errno, std::generic_category(), "map PE backing file");
+		const auto put = [&](std::span<const uint8_t> source, uint64_t offset) { std::memcpy(static_cast<uint8_t *>(mapping) + offset, source.data(), source.size()); };
+#else
 		const auto put = [&](std::span<const uint8_t> source, uint64_t offset) {
 			for (size_t done = 0; done < source.size();) {
 				const auto written = pwrite(fd, source.data() + done, source.size() - done, static_cast<off_t>(offset + done));
@@ -43,14 +53,20 @@ LoadedImage::LoadedImage(const PEImage &image, uint64_t base, bool relocated)
 				done += size_t(written);
 			}
 		};
+#endif
 		put(image.file_span(0, image.headers_size), 0);
 		for (const auto &section : image.sections)
 			if (section.file_size)
 				put(image.file_span(section.address, section.file_size), section.address);
+#ifndef __APPLE__
 		void *mapping = mmap(nullptr, size, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
 		if (mapping == MAP_FAILED)
 			throw std::system_error(errno, std::generic_category(), "map PE backing file");
+#endif
 		storage = static_cast<uint8_t *>(mapping);
+#ifdef __APPLE__
+		raven_register_image(fd, storage, size);
+#endif
 		for (size_t page = 0; page * page_size < image.headers_size; ++page)
 			protections[page] = PROT_READ;
 		for (const auto &section : image.sections) {
@@ -189,6 +205,10 @@ LoadedImage &LoadedImage::operator=(LoadedImage &&other) noexcept
 
 void LoadedImage::release()
 {
+#ifdef __APPLE__
+	if (fd >= 0 && storage)
+		raven_unregister_image(fd);
+#endif
 	if (storage)
 		munmap(storage, size);
 	if (fd >= 0)

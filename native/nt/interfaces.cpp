@@ -34,10 +34,12 @@ std::vector<HostInterface> host_interfaces()
 			std::strncpy(request.ifr_name, entry->ifa_name, IFNAMSIZ - 1);
 			if (::ioctl(probe, SIOCGIFMTU, &request) == 0)
 				interface.mtu = uint32_t(request.ifr_mtu);
+			#ifndef __APPLE__
 			if (interface.type != if_type_loopback && ::ioctl(probe, SIOCGIFHWADDR, &request) == 0) {
 				std::memcpy(interface.hardware, request.ifr_hwaddr.sa_data, 6);
 				interface.hardware_length = 6;
 			}
+#endif
 			::close(probe);
 		}
 		interfaces.push_back(std::move(interface));

@@ -186,7 +186,7 @@ void NativeThreads::thread_main(GuestThread &thread)
 		code = exit.code;
 	} catch (...) {
 		if (!pending)
-			pending = std::current_exception();
+			pending = PendingError::capture();
 		// RAVEN_TRACE_API names the thread and the error that ends the process from a thread other than the first.
 		if (std::getenv("RAVEN_TRACE_API")) {
 			try {
@@ -207,7 +207,7 @@ void NativeThreads::thread_main(GuestThread &thread)
 		} catch (...) {
 			// The first error is the one that ended the process: failing to save a thread of the process it ended must not replace it.
 			if (!pending)
-				pending = std::current_exception();
+				pending = PendingError::capture();
 			// The main thread rethrows it from its own switch; hand the processor to it directly.
 			auto &main = *threads.front();
 			if (main.state != GuestThread::State::done && &main != running) {
@@ -345,7 +345,7 @@ void NativeThreads::check_pending()
 	pending = nullptr;
 	// The error that ended another thread ends the process; the call this thread was in, waiting or running, will never complete.
 	process.end_call();
-	std::rethrow_exception(exception);
+	exception.rethrow();
 }
 
 void NativeThreads::switch_to(GuestThread &next)

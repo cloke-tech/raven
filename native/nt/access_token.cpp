@@ -42,11 +42,19 @@ public:
 		lock.l_whence = SEEK_SET;
 		int result;
 		do result = ::fcntl(descriptor, F_SETLKW, &lock); while (result < 0 && errno == EINTR);
+#ifdef __APPLE__
+		// POSIX-Shm kennt unter Darwin keine fcntl-Sperren: ohne Sperre weiterarbeiten
+		if (result < 0)
+			this->descriptor = -1;
+#else
 		if (result < 0)
 			throw std::runtime_error("cannot lock access token storage");
+#endif
 	}
 	~TokenLock()
 	{
+		if (descriptor < 0)
+			return;
 		struct flock lock{};
 		lock.l_type = F_UNLCK;
 		lock.l_whence = SEEK_SET;
@@ -62,7 +70,7 @@ private:
 void AccessToken::map()
 {
 	struct stat information{};
-	if (descriptor < 0 || ::fstat(descriptor, &information) || information.st_size != sizeof(Shared))
+	if (descriptor < 0 || ::fstat(descriptor, &information) || off_t(information.st_size) < off_t(sizeof(Shared)))
 		throw std::runtime_error("invalid access token storage");
 	const auto mapped = ::mmap(nullptr, sizeof(Shared), PROT_READ | PROT_WRITE, MAP_SHARED, descriptor, 0);
 	if (mapped == MAP_FAILED)

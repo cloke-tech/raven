@@ -133,6 +133,11 @@ uint64_t NativeDesktop::create_section(std::span<const uint64_t> args)
 		}
 		while (palette.size() < (1U << bits)) palette.push_back(0);
 	}
+	if (std::getenv("RAVEN_TRACE_FAIL") && !palette.empty()) {
+		std::cerr << "dib palette";
+		for (size_t i = 0; i < std::min<size_t>(6, palette.size()); ++i) std::cerr << ' ' << std::hex << palette[i] << std::dec;
+		std::cerr << " usage=" << uint32_t(args[2]) << '\n';
+	}
 	const auto bitmap=allocate_dib(uint32_t(width),uint32_t(height<0 ? -height : height),bits,height<0,std::move(palette),args[4],uint32_t(args[5]));
 	if (!bitmap) return 0;
 	try {

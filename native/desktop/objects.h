@@ -122,6 +122,8 @@ struct DesktopDC {
 	bool window_frame = false;
 	uint32_t text_color = 0,background_color = 0xffffff,background_mode = 2;
 	uint64_t brush = desktop_stock_brush;
+	// The logical palette selected into the context (SelectPalette); RealizePalette puts it into the colour table of a selected DIB section.
+	uint64_t palette = 0;
 	int32_t origin_x=0,origin_y=0;
 	std::optional<DesktopRect> bounds{};
 	// Application clipping is independent of BeginPaint's update region.

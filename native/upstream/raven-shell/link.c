@@ -13,6 +13,7 @@
 #define _WIN32_WINNT 0x0601
 #include <windows.h>
 #include <shobjidl.h>
+#include <propsys.h>
 #include <stddef.h>
 #include <string.h>
 
@@ -30,6 +31,7 @@
 typedef struct {
 	const IShellLinkWVtbl *link_vtbl;
 	const IPersistFileVtbl *file_vtbl;
+	const IPropertyStoreVtbl *store_vtbl;
 	LONG refs;
 	WCHAR path[MAX_PATH], relative[MAX_PATH], directory[MAX_PATH], icon[MAX_PATH], current[MAX_PATH];
 	WCHAR arguments[TEXT_MAX], description[TEXT_MAX];
@@ -76,6 +78,7 @@ static HRESULT get_text(const WCHAR *from, WCHAR *to, int capacity)
 }
 
 #define LINK_OF_LINK(self) ((LinkObject *)(self))
+#define LINK_OF_STORE(self) ((LinkObject *)((char *)(self) - offsetof(LinkObject, store_vtbl)))
 #define LINK_OF_FILE(self) ((LinkObject *)((char *)(self) - offsetof(LinkObject, file_vtbl)))
 
 /* IUnknown -------------------------------------------------------------------------------------------------- */
@@ -89,6 +92,8 @@ static HRESULT link_query(LinkObject *link, REFIID iid, void **out)
 		*out = &link->link_vtbl;
 	} else if (same_guid(iid, &IID_IPersistFile) || same_guid(iid, &IID_IPersist)) {
 		*out = &link->file_vtbl;
+	} else if (same_guid(iid, &IID_IPropertyStore)) {
+		*out = &link->store_vtbl;
 	} else {
 		return E_NOINTERFACE;
 	}
@@ -586,6 +591,27 @@ static HRESULT WINAPI pf_current_file(IPersistFile *self, LPOLESTR *file)
 	return S_OK;
 }
 
+/* IPropertyStore ---------------------------------------------------------------------------------------------- */
+
+/* Installers set the application's user model id on a link through this; the link file format here has no place for properties,
+ * so the store takes the values and answers every key as empty. */
+static HRESULT STDMETHODCALLTYPE store_query(IPropertyStore *self, REFIID iid, void **out) { return link_query(LINK_OF_STORE(self), iid, out); }
+static ULONG STDMETHODCALLTYPE store_add_ref(IPropertyStore *self) { return link_add_ref(LINK_OF_STORE(self)); }
+static ULONG STDMETHODCALLTYPE store_release(IPropertyStore *self) { return link_release(LINK_OF_STORE(self)); }
+static HRESULT STDMETHODCALLTYPE store_count(IPropertyStore *self, DWORD *count) { if (!count) return E_POINTER; *count = 0; return S_OK; }
+static HRESULT STDMETHODCALLTYPE store_at(IPropertyStore *self, DWORD index, PROPERTYKEY *key) { return E_INVALIDARG; }
+static HRESULT STDMETHODCALLTYPE store_get(IPropertyStore *self, REFPROPERTYKEY key, PROPVARIANT *value)
+{
+	if (!value)
+		return E_POINTER;
+	memset(value, 0, sizeof(*value));
+	return S_OK;
+}
+static HRESULT STDMETHODCALLTYPE store_set(IPropertyStore *self, REFPROPERTYKEY key, REFPROPVARIANT value) { return S_OK; }
+static HRESULT STDMETHODCALLTYPE store_commit(IPropertyStore *self) { return S_OK; }
+
+static const IPropertyStoreVtbl store_vtbl = {store_query, store_add_ref, store_release, store_count, store_at, store_get, store_set, store_commit};
+
 static const IPersistFileVtbl file_vtbl = {
 	pf_query, pf_add_ref, pf_release, pf_class_id, pf_is_dirty, pf_load, pf_save, pf_save_completed, pf_current_file,
 };
@@ -598,6 +624,7 @@ HRESULT raven_make_shell_link(REFIID iid, void **out)
 		return E_OUTOFMEMORY;
 	link->link_vtbl = &link_vtbl;
 	link->file_vtbl = &file_vtbl;
+	link->store_vtbl = &store_vtbl;
 	link->refs = 1;
 	link->show = SW_SHOWNORMAL;
 	result = link_query(link, iid, out);

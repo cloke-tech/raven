@@ -10,13 +10,19 @@
 #include <fcntl.h>
 #include <filesystem>
 #include <functional>
+#ifdef __APPLE__
+#include "platform/futex_darwin.h"
+#else
 #include <linux/futex.h>
+#endif
 #include <memory>
 #include <mutex>
 #include <string>
 #include <sys/file.h>
 #include <sys/mman.h>
+#ifndef __APPLE__
 #include <sys/syscall.h>
+#endif
 #include <thread>
 #include <unistd.h>
 
@@ -58,11 +64,16 @@ inline std::atomic<uint32_t> *shared_changes()
 	return word;
 }
 
+#ifndef __APPLE__
+#define RAVEN_FUTEX_WAKE_ALL(word) ::syscall(SYS_futex, word, FUTEX_WAKE, INT32_MAX, nullptr, nullptr, 0)
+#define RAVEN_FUTEX_WAIT(word, seen) ::syscall(SYS_futex, word, FUTEX_WAIT, seen, nullptr, nullptr, 0)
+#endif
+
 inline void announce_shared_change()
 {
 	if (auto *word = shared_changes()) {
 		word->fetch_add(1);
-		::syscall(SYS_futex, word, FUTEX_WAKE, INT32_MAX, nullptr, nullptr, 0);
+		RAVEN_FUTEX_WAKE_ALL(word);
 	}
 }
 
@@ -80,7 +91,7 @@ inline void listen_shared_changes()
 		std::thread([word] {
 			for (;;) {
 				const uint32_t seen = word->load();
-				::syscall(SYS_futex, word, FUTEX_WAIT, seen, nullptr, nullptr, 0);
+				RAVEN_FUTEX_WAIT(word, seen);
 				if (const int descriptor = shared_change_listener.load(); descriptor >= 0) {
 					const uint64_t one = 1;
 					[[maybe_unused]] const auto written = ::write(descriptor, &one, sizeof one);

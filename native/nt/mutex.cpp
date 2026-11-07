@@ -22,7 +22,7 @@ MutexObject::MutexObject(int descriptor) : descriptor(descriptor)
 {
 	try {
 		struct stat information{};
-		if (descriptor < 0 || ::fstat(descriptor, &information) || information.st_size != sizeof(MutexState))
+		if (descriptor < 0 || ::fstat(descriptor, &information) || off_t(information.st_size) < off_t(sizeof(MutexState)))
 			throw std::runtime_error("invalid mutex storage");
 		void *mapped = ::mmap(nullptr, sizeof(MutexState), PROT_READ | PROT_WRITE, MAP_SHARED, descriptor, 0);
 		if (mapped == MAP_FAILED)

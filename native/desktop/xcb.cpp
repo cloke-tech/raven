@@ -41,10 +41,10 @@ template <typename T> struct Reply {
 
 constexpr const char *atom_names[]={"WM_PROTOCOLS","WM_DELETE_WINDOW","WM_NAME","WM_CLASS","_NET_WM_NAME","UTF8_STRING","STRING","TEXT",
 	"CLIPBOARD","TARGETS","text/plain;charset=utf-8","text/plain","RAVEN_SELECTION","INCR","_NET_WM_STATE","_NET_WM_STATE_MAXIMIZED_VERT",
-	"_NET_WM_STATE_MAXIMIZED_HORZ","_NET_WM_MOVERESIZE","_MOTIF_WM_HINTS","_NET_WM_WINDOW_TYPE","_NET_WM_WINDOW_TYPE_POPUP_MENU","ATOM","WM_CHANGE_STATE","WM_STATE"};
+	"_NET_WM_STATE_MAXIMIZED_HORZ","_NET_WM_MOVERESIZE","_MOTIF_WM_HINTS","_NET_WM_WINDOW_TYPE","_NET_WM_WINDOW_TYPE_POPUP_MENU","ATOM","WM_CHANGE_STATE","WM_STATE","_CLOKE_TITLEBAR","_CLOKE_MENU","_CLOKE_MENU_ACTIVATE"};
 enum Atom { wm_protocols, wm_delete_window, wm_name, wm_class, net_wm_name, utf8_string, string_type, text_type, clipboard, targets,
 	text_utf8, text_plain, raven_selection, incr, net_wm_state, maximized_vert, maximized_horz, net_wm_moveresize, motif_hints,
-	window_type, window_type_popup, atom_type, wm_change_state, wm_state, atom_count };
+	window_type, window_type_popup, atom_type, wm_change_state, wm_state, cloke_titlebar, cloke_menu, cloke_menu_activate, atom_count };
 
 }
 
@@ -58,6 +58,11 @@ struct XcbPresentation::State {
 		uint64_t parent=0;
 		bool closed=false, close_posted=false, resized=false, maximized=false, mapped=false, iconic=false;
 		uint32_t width=0,height=0,pending_width=0,pending_height=0;
+		// What the window manager frames: the host window is the frame minus these (left, top, right, bottom); width and height stay the frame's.
+		std::array<int32_t,4> inset{0,0,0,0};
+		// The style bits and size the title bar properties were last set for.
+		uint32_t hint_style=0,hint_width=0,hint_height=0;
+		std::string menu_sent;
 		std::string title;
 		// The frame the window shows, kept to repaint what the server exposes and to send only what changed.
 		std::vector<uint8_t> shown;
@@ -73,6 +78,57 @@ struct XcbPresentation::State {
 	};
 	std::map<uint64_t,Hosted> hosted;
 	std::map<uint64_t,uint64_t> transient_owners;
+	std::function<std::array<int32_t,5>(uint64_t)> insets_provider;
+	std::function<std::string(uint64_t)> menu_provider;
+	uint32_t last_style=0;
+	// The window manager frames windows that have a caption (CloakServer's title bar); RAVEN_FRAME=raven keeps the old way, where the program's
+	// frame is drawn by Raven and the window manager adds none.
+	static bool wm_frames() { static const bool on=!std::getenv("RAVEN_FRAME") || std::string_view(std::getenv("RAVEN_FRAME"))!="raven"; return on; }
+	std::array<int32_t,4> inset_for(uint64_t handle,uint32_t width,uint32_t height) {
+		if (!insets_provider || !wm_frames()) return {0,0,0,0};
+		const auto given=insets_provider(handle);
+		last_style=uint32_t(given[4]);
+		std::array<int32_t,4> value{given[0],given[1],given[2],given[3]};
+		for (auto &part : value) part=std::max(part,0);
+		if (int64_t(value[0])+value[2]+8>=int64_t(width) || int64_t(value[1])+value[3]+8>=int64_t(height)) return {0,0,0,0};
+		return value;
+	}
+	// Tells the window manager which title bar buttons the program's window has (a dialog has no zoom, a fixed window no resizing): lights
+	// for the buttons it lacks are greyed (_CLOKE_TITLEBAR[4] bits 3 to 5: close, minimize, zoom) and a fixed window gets equal minimum and maximum sizes.
+	void apply_hints(Window &window,uint32_t style,uint32_t host_width,uint32_t host_height) {
+		const bool framed=window.inset!=std::array<int32_t,4>{0,0,0,0};
+		const bool fixed=framed && !(style & 0x40000U);
+		if (window.hint_style==(style|0x80000000U) && (!fixed || (window.hint_width==host_width && window.hint_height==host_height))) return;
+		window.hint_style=style|0x80000000U; window.hint_width=host_width; window.hint_height=host_height;
+		if (!framed) return;
+		uint32_t title[6]={0,0,0,0,0,0};
+		if (!(style & 0x80000U)) title[4]|=1U<<3;
+		if (!(style & 0x20000U)) title[4]|=1U<<4;
+		if (!(style & 0x10000U) || fixed) title[4]|=1U<<5;
+		property(window.id,atoms[cloke_titlebar],XCB_ATOM_CARDINAL,32,6,title);
+		if (fixed) {
+			// WM_SIZE_HINTS: flags PMinSize|PMaxSize, four unused longs, then the minimum and the maximum size.
+			uint32_t hints[18]={};
+			hints[0]=16|32; hints[5]=hints[7]=host_width; hints[6]=hints[8]=host_height;
+			property(window.id,XCB_ATOM_WM_NORMAL_HINTS,XCB_ATOM_WM_SIZE_HINTS,32,18,hints);
+		} else {
+			xcb_delete_property(connection,window.id,XCB_ATOM_WM_NORMAL_HINTS);
+		}
+	}
+	// The window's menu for the global menu bar (_CLOKE_MENU), sent when it changed.
+	void update_menu(uint64_t handle,Window &window) {
+		if (!menu_provider || window.inset==std::array<int32_t,4>{0,0,0,0}) return;
+		const auto text=menu_provider(handle);
+		if (text==window.menu_sent) return;
+		window.menu_sent=text;
+		if (tracing()) std::fprintf(stderr,"x11: menu of %llx: %zu bytes, %zu lines\n",(unsigned long long)handle,text.size(),size_t(std::count(text.begin(),text.end(),'\n')));
+		if (text.empty()) xcb_delete_property(connection,window.id,atoms[cloke_menu]);
+		else property(window.id,atoms[cloke_menu],XCB_ATOM_STRING,8,uint32_t(text.size()),text.data());
+	}
+	std::array<int32_t,4> inset_of(uint64_t handle) const {
+		const auto found=windows.find(handle);
+		return found!=windows.end() ? found->second->inset : std::array<int32_t,4>{0,0,0,0};
+	}
 	xcb_connection_t *connection=nullptr;
 	xcb_screen_t *screen=nullptr;
 	xcb_gcontext_t gc=0;
@@ -161,7 +217,8 @@ struct XcbPresentation::State {
 
 	void pointer_event(DesktopEventKind kind,uint32_t button=0,uint32_t pressed=0) {
 		if (!pointer_window && kind==DesktopEventKind::pointer_motion) return;
-		queue({pointer_window,button,pressed,0,kind,pointer_x,pointer_y});
+		const auto inset=inset_of(pointer_window);
+		queue({pointer_window,button,pressed,0,kind,pointer_x+inset[0],pointer_y+inset[1]});
 	}
 
 	void property(xcb_window_t window,xcb_atom_t name,xcb_atom_t type,uint8_t format,uint32_t count,const void *data) {
@@ -390,8 +447,11 @@ struct XcbPresentation::State {
 		xcb_create_window(connection,XCB_COPY_FROM_PARENT,id,screen->root,int16_t(x),int16_t(y),uint16_t(width),uint16_t(height),0,
 			XCB_WINDOW_CLASS_INPUT_OUTPUT,XCB_COPY_FROM_PARENT,
 			XCB_CW_BACK_PIXMAP|XCB_CW_BORDER_PIXEL|XCB_CW_BIT_GRAVITY|XCB_CW_OVERRIDE_REDIRECT|XCB_CW_EVENT_MASK|XCB_CW_CURSOR,values);
-		static constexpr char name[]="raven.native\0raven.native";
-		property(id,atoms[wm_class],atoms[string_type],8,sizeof name,name);
+		// The class of the window is the name of the program (RAVEN_WM_CLASS), raven.native without one.
+		const char *program=std::getenv("RAVEN_WM_CLASS");
+		std::string name=program && *program ? program : "raven.native";
+		name.push_back('\0'); name+=program && *program ? program : "raven.native"; name.push_back('\0');
+		property(id,atoms[wm_class],atoms[string_type],8,uint32_t(name.size()),name.data());
 		if (popup) property(id,atoms[window_type],atoms[atom_type],32,1,&atoms[window_type_popup]);
 		return id;
 	}
@@ -444,7 +504,7 @@ struct XcbPresentation::State {
 		const auto owner=windows.find(parent);
 		if (owner==windows.end() || !owner->second->id) throw std::runtime_error("X11 popup has no presented parent window");
 		Reply place(xcb_translate_coordinates_reply(connection,xcb_translate_coordinates(connection,owner->second->id,screen->root,
-			int16_t(x),int16_t(y)),nullptr));
+			int16_t(x-owner->second->inset[0]),int16_t(y-owner->second->inset[1])),nullptr));
 		if (!place) throw std::runtime_error("cannot place X11 popup");
 		const std::array<int32_t,4> area{place->dst_x,place->dst_y,place->dst_x+int32_t(width),place->dst_y+int32_t(height)};
 		if (found==windows.end()) {
@@ -534,12 +594,18 @@ struct XcbPresentation::State {
 		if (found==windows.end()) {
 			auto window=std::make_unique<Window>();
 			window->width=width; window->height=height;
+			window->inset=inset_for(handle,width,height);
+			const uint32_t host_width=width-uint32_t(window->inset[0]+window->inset[2]),host_height=height-uint32_t(window->inset[1]+window->inset[3]);
 			window->maximized=maximized.contains(handle);
-			window->id=make_window(false,0,0,width,height);
+			window->id=make_window(false,0,0,host_width,host_height);
 			property(window->id,atoms[wm_protocols],atoms[atom_type],32,1,&atoms[wm_delete_window]);
-			// Raven draws the frame itself, as on Wayland; the window manager adds none.
-			const uint32_t hints[]={2,0,0,0,0};
-			property(window->id,atoms[motif_hints],atoms[motif_hints],32,5,hints);
+			// A window with a caption gets the window manager's title bar; without one Raven draws what there is and the window manager adds none.
+			if (window->inset==std::array<int32_t,4>{0,0,0,0}) {
+				const uint32_t hints[]={2,0,0,0,0};
+				property(window->id,atoms[motif_hints],atoms[motif_hints],32,5,hints);
+			}
+			apply_hints(*window,last_style,host_width,host_height);
+			update_menu(handle,*window);
 			set_title(*window,title);
 			set_maximized(*window,window->maximized,false);
 			apply_transient(handle,*window);
@@ -562,13 +628,30 @@ struct XcbPresentation::State {
 		if (window.maximized && window.pending_width && window.pending_height &&
 			(window.pending_width!=width || window.pending_height!=height)) return;
 		if (window.pending_width==width && window.pending_height==height) window.resized=false;
+		// What the window manager frames can change with the style (a menu added, a caption taken off): the host window follows.
+		const auto inset=inset_for(handle,width,height);
+		const bool inset_changed=inset!=window.inset;
+		window.inset=inset;
+		const uint32_t host_width=width-uint32_t(inset[0]+inset[2]),host_height=height-uint32_t(inset[1]+inset[3]);
 		// A frame of another size is the program resizing its window, unless the window manager's own resize is still being answered.
-		if ((window.width!=width || window.height!=height) && !window.resized) {
-			const uint32_t values[]={width,height};
+		if ((window.width!=width || window.height!=height || inset_changed) && !window.resized) {
+			const uint32_t values[]={host_width,host_height};
 			xcb_configure_window(connection,window.id,XCB_CONFIG_WINDOW_WIDTH|XCB_CONFIG_WINDOW_HEIGHT,values);
 		}
+		if (tracing()) std::fprintf(stderr,"x11: present %llx frame %ux%u host %ux%u inset %d,%d,%d,%d\n",(unsigned long long)handle,width,height,host_width,host_height,inset[0],inset[1],inset[2],inset[3]);
 		window.width=width; window.height=height;
-		attach_frame(window,width,height,pixels);
+		apply_hints(window,last_style,host_width,host_height);
+		update_menu(handle,window);
+		if (inset_changed) window.shown_width=0;
+		if (inset==std::array<int32_t,4>{0,0,0,0}) {
+			attach_frame(window,width,height,pixels);
+		} else {
+			// Only the part the host window shows is sent.
+			std::vector<uint8_t> cropped(size_t(host_width)*host_height*4);
+			for (uint32_t row=0;row<host_height;++row)
+				std::memcpy(cropped.data()+size_t(row)*host_width*4,pixels.data()+(size_t(row)+size_t(inset[1]))*width*4+size_t(inset[0])*4,size_t(host_width)*4);
+			attach_frame(window,host_width,host_height,cropped);
+		}
 		xcb_flush(connection);
 		if (xcb_connection_has_error(connection)) throw std::runtime_error("X11 connection failed during presentation");
 	}
@@ -691,8 +774,9 @@ struct XcbPresentation::State {
 			const auto &event=*reinterpret_cast<const xcb_configure_notify_event_t *>(generic);
 			auto *window=window_of(event.window);
 			if (!window || window->is_popup || event.window!=event.event) return;
-			if (event.width==window->width && event.height==window->height) { window->resized=false; window->pending_width=window->pending_height=0; return; }
-			window->pending_width=event.width; window->pending_height=event.height; window->resized=true;
+			const uint32_t frame_width=event.width+uint32_t(window->inset[0]+window->inset[2]),frame_height=event.height+uint32_t(window->inset[1]+window->inset[3]);
+			if (frame_width==window->width && frame_height==window->height) { window->resized=false; window->pending_width=window->pending_height=0; return; }
+			window->pending_width=frame_width; window->pending_height=frame_height; window->resized=true;
 			return;
 		}
 		case XCB_MAP_NOTIFY: case XCB_UNMAP_NOTIFY: {
@@ -724,6 +808,9 @@ struct XcbPresentation::State {
 			const auto &event=*reinterpret_cast<const xcb_client_message_event_t *>(generic);
 			if (event.type==atoms[wm_protocols] && event.data.data32[0]==atoms[wm_delete_window])
 				if (auto *window=window_of(event.window)) window->closed=true;
+			// The choice of an entry of the window's menu in the global menu bar: WM_COMMAND with its number.
+			if (event.type==atoms[cloke_menu_activate])
+				if (const auto handle=handle_of(event.window)) queue({handle,0x111,uint64_t(event.data.data32[0] & 0xffff),0});
 			return;
 		}
 		case XCB_FOCUS_IN: case XCB_FOCUS_OUT: {
@@ -754,7 +841,7 @@ struct XcbPresentation::State {
 			root_x=event.root_x; root_y=event.root_y;
 			const auto *window=window_of(event.event);
 			// Under a popup grab the pointer outside the program's windows is reported to the popup; it is over no window then.
-			if (!window || event.event_x<0 || event.event_y<0 || event.event_x>=int32_t(window->width) || event.event_y>=int32_t(window->height)) return;
+			if (!window || event.event_x<0 || event.event_y<0 || event.event_x>=int32_t(window->width)-window->inset[0]-window->inset[2] || event.event_y>=int32_t(window->height)-window->inset[1]-window->inset[3]) return;
 			pointer_window=handle_of(event.event);
 			pointer_x=event.event_x; pointer_y=event.event_y;
 			pointer_event(DesktopEventKind::pointer_motion);
@@ -854,6 +941,7 @@ struct XcbPresentation::State {
 		const xcb_window_t parent=found!=windows.end() && found->second->id ? found->second->id : screen->root;
 		shown=shown && parent!=screen->root;
 		width=std::clamp(width,1U,8192U); height=std::clamp(height,1U,8192U);
+		if (found!=windows.end()) { x-=found->second->inset[0]; y-=found->second->inset[1]; }
 		auto &entry=hosted[window];
 		if (!entry.id) {
 			entry.id=xcb_generate_id(connection);
@@ -893,7 +981,8 @@ struct XcbPresentation::State {
 		release_constraint();
 		const auto found=windows.find(handle);
 		if (rectangle && found!=windows.end() && !found->second->is_popup && found->second->id) {
-			const auto &value=*rectangle;
+			auto value=*rectangle;
+			value[0]-=found->second->inset[0]; value[2]-=found->second->inset[0]; value[1]-=found->second->inset[1]; value[3]-=found->second->inset[1];
 			// A rectangle of a point or two holds the pointer still: raw motion keeps being reported.
 			const bool locked=value[2]-value[0]<=2 && value[3]-value[1]<=2;
 			confinement=xcb_generate_id(connection);
@@ -1021,6 +1110,8 @@ DesktopPresentation XcbPresentation::callbacks()
 	result.platform=HostPlatform::xcb;
 	result.minimize=[this](uint64_t handle) { state->minimize(handle); };
 	result.transient_for=[this](uint64_t handle,uint64_t owner) { state->transient_for(handle,owner); };
+	result.frame_insets=[this](std::function<std::array<int32_t,5>(uint64_t)> provider) { state->insets_provider=std::move(provider); };
+	result.menu_text=[this](std::function<std::string(uint64_t)> provider) { state->menu_provider=std::move(provider); };
 	return result;
 }
 

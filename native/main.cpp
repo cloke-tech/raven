@@ -39,6 +39,7 @@
 #include <cstring>
 #include <fcntl.h>
 #include <unistd.h>
+#include "menu.h"
 #include <sys/wait.h>
 #include <stdexcept>
 
@@ -136,6 +137,11 @@ static void show_fault(int signal)
 
 int main(int argc, char **argv)
 {
+	// Diagnose: jeder Prozess schreibt seine Meldungen in <RAVEN_TRACE_FILE>.<pid> (Kindprozesse haben sonst kein stderr)
+	if (const char *trace = std::getenv("RAVEN_TRACE_FILE"); trace && *trace) {
+		const std::string path = std::string(trace) + "." + std::to_string(::getpid());
+		[[maybe_unused]] auto *reopened = std::freopen(path.c_str(), "a", stderr);
+	}
 	if (std::getenv("RAVEN_BACKTRACE")) {
 		std::set_terminate(show_backtrace);
 		std::signal(SIGSEGV, show_fault);
@@ -148,12 +154,27 @@ int main(int argc, char **argv)
 			return 2;
 		// A file is fully buffered once opened; diagnostics are read while the process runs, a line at a time.
 		std::setvbuf(stderr, nullptr, _IOLBF, 0);
+		// Gets the file another descriptor than 2 (a child starts without standard handles), std::cerr still writes to 2.
+		if (::fileno(stderr) != 2)
+			::dup2(::fileno(stderr), 2);
 	}
 	const std::string mode = argc > 1 ? argv[1] : "";
 	// A restart of Windows: the moves and deletions installers left for it, then the programs that run once at the next logon.
 	if (mode == "--reboot") {
-		const auto done = raven::simulate_restart(raven::NativePrefix::from_environment(), std::filesystem::read_symlink("/proc/self/exe"));
+		const auto done = raven::simulate_restart(raven::NativePrefix::from_environment(), raven_self_exe());
 		std::cout << "restarted: " << done << " pending operations and programs ran\n";
+		return 0;
+	}
+	// ClokeOS: the Start Menu shortcuts of the prefix become application bundles in ~/Applications (or the folder named).
+	if (mode == "--add-app" && argc > 2) {
+		std::filesystem::path applications = argc > 3 ? std::filesystem::path(argv[3]) : std::filesystem::path(std::getenv("HOME") ? std::getenv("HOME") : ".") / "Applications";
+		std::cout << (raven::menu::add_app(raven::NativePrefix::from_environment(), argv[2], applications) ? "app added\n" : "no app added\n");
+		return 0;
+	}
+	if (mode == "--install-menu") {
+		std::filesystem::path applications = argc > 2 ? std::filesystem::path(argv[2]) : std::filesystem::path(std::getenv("HOME") ? std::getenv("HOME") : ".") / "Applications";
+		const auto count = raven::menu::install(raven::NativePrefix::from_environment(), applications);
+		std::cout << "menu: " << count << " programs in " << applications.string() << '\n';
 		return 0;
 	}
 	// Snapshots of the prefix: taken by hand, listed, and restored, the newest unless one is named.
@@ -301,14 +322,14 @@ int main(int argc, char **argv)
 			}
 			if (run_modules || run_process) {
 #ifdef RAVEN_NATIVE_CPU
-				const auto bootstrap = std::filesystem::read_symlink("/proc/self/exe").parent_path() / "raven-bootstrap";
+				const auto bootstrap = raven_self_exe().parent_path() / "raven-bootstrap";
 				if (run_process) {
 					const auto directory = std::filesystem::absolute(argv[first_file]).parent_path();
 					const raven::NativePrefix prefix=raven::NativePrefix::from_environment();
 					// The system's own programs, libraries and tables the runtime ships, in the system directory of each width as Windows has them; a
 					// copy that is missing or differs from the runtime's is put back.
 					{
-						const auto runtime = std::filesystem::read_symlink("/proc/self/exe").parent_path();
+						const auto runtime = raven_self_exe().parent_path();
 						for (const auto &[from, folder] : {std::pair{runtime, "system32"}, std::pair{runtime / "x86", "syswow64"}})
 							for (const char *program : {"cmd.exe", "msiexec.exe", "regsvr32.exe", "control.exe", "dism.exe", "fondue.exe", "regedit.exe", "mscoree.dll", "riched20.dll",
 									"msftedit.dll", "l_intl.nls", "find.exe", "findstr.exe", "more.com", "sort.exe", "where.exe", "xcopy.exe", "attrib.exe",
@@ -318,7 +339,7 @@ int main(int argc, char **argv)
 								// The 64-bit Registry Editor lives in the Windows folder itself.
 								const bool windows_folder = std::string_view(program) == "regedit.exe" && std::string_view(folder) == "system32";
 								const auto source_file = from / program,
-									target = windows_folder ? prefix.root() / "drive_c" / "windows" / program : prefix.root() / "drive_c" / "windows" / folder / program;
+									target = windows_folder ? prefix.windows_directory() / program : prefix.windows_directory() / folder / program;
 								if (!std::filesystem::exists(source_file, error))
 									continue;
 								if (std::filesystem::exists(target, error) && std::filesystem::file_size(target, error) == std::filesystem::file_size(source_file, error) &&
@@ -336,9 +357,9 @@ int main(int argc, char **argv)
 								const auto file = from / server;
 								if (std::filesystem::exists(file, error))
 									stamp += file.string() + " " + std::to_string(std::filesystem::file_size(file, error)) + " " +
-										std::to_string(std::filesystem::last_write_time(file, error).time_since_epoch().count()) + "\n";
+										std::to_string(static_cast<long long>(std::filesystem::last_write_time(file, error).time_since_epoch().count())) + "\n";
 							}
-						const auto marker = prefix.root() / "drive_c" / "windows" / "raven-registered.txt";
+						const auto marker = prefix.windows_directory() / "raven-registered.txt";
 						std::string recorded;
 						if (std::ifstream input(marker); input)
 							recorded.assign(std::istreambuf_iterator<char>(input), {});
@@ -347,7 +368,7 @@ int main(int argc, char **argv)
 							// The prefix counts as registered only when every registration succeeded; a failed one is tried again next time.
 							bool registered = true;
 							for (const char *folder : {"system32", "syswow64"}) {
-								const auto program = prefix.root() / "drive_c" / "windows" / folder / "regsvr32.exe";
+								const auto program = prefix.windows_directory() / folder / "regsvr32.exe";
 								if (!std::filesystem::exists(program))
 									continue;
 								for (const char *server : servers) {
@@ -357,7 +378,7 @@ int main(int argc, char **argv)
 										// Setup is quiet: only a failure says anything, on standard error.
 										if (const int quiet = ::open("/dev/null", O_WRONLY | O_CLOEXEC); quiet >= 0)
 											::dup2(quiet, 1);
-										const std::string self = std::filesystem::read_symlink("/proc/self/exe").string(), path = program.string();
+										const std::string self = raven_self_exe().string(), path = program.string();
 										::execl(self.c_str(), self.c_str(), "--run-process", "--execution=native", "--timeout-ms=60000", path.c_str(), "--", "/s",
 											server, static_cast<char *>(nullptr));
 										::_exit(127);
@@ -376,6 +397,15 @@ int main(int argc, char **argv)
 					// like an installer and that no other program started. The ten newest of these snapshots are kept.
 					const bool started_alone = !command_line_text && handle_channel_fd < 0;
 					const auto program_name = std::filesystem::path(argv[first_file]).filename().string();
+					// ClokeOS: the windows of the program carry its name as the X11 window class (the menu bar and the Dock know it by that name)
+					{
+						std::string window_class = std::filesystem::path(argv[first_file]).stem().string();
+						for (auto &character : window_class)
+							if (character == ' ' || character == '\t')
+								character = '_';
+						if (!window_class.empty())
+							setenv("RAVEN_WM_CLASS", window_class.c_str(), 1);
+					}
 					if (started_alone && !std::getenv("RAVEN_PREFIX_SETUP") && !std::getenv("RAVEN_NO_SNAPSHOT") && raven::installer_like(entry->image, program_name)) {
 						try {
 							raven::take_snapshot(prefix.root(), "install-" + std::filesystem::path(program_name).stem().string());
@@ -385,7 +415,7 @@ int main(int argc, char **argv)
 						}
 					}
 					// The libraries installed for every program, in the system directory of the program's width.
-					const auto system_directory = prefix.root() / "drive_c" / "windows" / (entry->image.is_64 ? "system32" : "syswow64");
+					const auto system_directory = prefix.windows_directory() / (entry->image.is_64 ? "system32" : "syswow64");
 					// The program's own manifest names the side-by-side assemblies its libraries come from; it is read from the file, as the
 					// first libraries are found before the process exists.
 					{
@@ -396,7 +426,7 @@ int main(int argc, char **argv)
 								manifest.assign(reinterpret_cast<const char *>(bytes.data()), bytes.size());
 								break;
 							}
-						raven::activation_contexts().prepare(prefix.root() / "drive_c" / "windows" / "WinSxS" / "Manifests", entry->image.is_64, manifest,
+						raven::activation_contexts().prepare(prefix.windows_directory() / "WinSxS" / "Manifests", entry->image.is_64, manifest,
 							std::filesystem::absolute(argv[first_file]).parent_path());
 					}
 					// A library of the other width is passed over, as the Windows loader goes on searching past it.
@@ -428,7 +458,7 @@ int main(int argc, char **argv)
 					// known once the program's launch is (below), before its libraries are loaded.
 					std::vector<std::filesystem::path> later_folders;
 					// The components for 32-bit programs are the same libraries built for 32 bits, in a directory beside the runtime.
-					const auto component_directory = std::filesystem::read_symlink("/proc/self/exe").parent_path() / (entry->image.is_64 ? "" : "x86");
+					const auto component_directory = raven_self_exe().parent_path() / (entry->image.is_64 ? "" : "x86");
 					const auto source = [&](std::string_view name) -> std::optional<raven::ModuleBytes> {
 #ifdef RAVEN_OPENGL
 						if (entry->image.is_64 && raven::OpenGLBridge::enabled() && name == "opengl32.dll") return std::nullopt;
@@ -451,7 +481,7 @@ int main(int argc, char **argv)
 						// A 64-bit program built against msvcrt.dll gets the C runtime component as that library too: a runtime of its own, as
 						// msvcrt is beside ucrtbase on Windows.
 						if (!selected && name=="msvcrt.dll" && entry->image.is_64) {
-							const auto component = std::filesystem::read_symlink("/proc/self/exe").parent_path() / "ucrtbase.dll";
+							const auto component = raven_self_exe().parent_path() / "ucrtbase.dll";
 							if (std::filesystem::exists(component))
 								return read_module(component.c_str());
 						}
@@ -461,13 +491,13 @@ int main(int argc, char **argv)
 								return read_module(component.c_str());
 						if (!selected && name=="ucrtbase.dll") {
 							// A 32-bit program gets the 32-bit build of the component.
-							const auto component = std::filesystem::read_symlink("/proc/self/exe").parent_path() / (entry->image.is_64 ? "ucrtbase.dll" : "ucrtbase32.dll");
+							const auto component = raven_self_exe().parent_path() / (entry->image.is_64 ? "ucrtbase.dll" : "ucrtbase32.dll");
 							if (std::filesystem::exists(component))
 								return read_module(component.c_str());
 						}
 						// DirectWrite, Direct2D and Windows Animation are the runtime's own components too: the library names resolve to them.
 						if (!selected && (name=="dwrite.dll" || name=="d2d1.dll" || name=="uianimation.dll") && entry->image.is_64) {
-							const auto component = std::filesystem::read_symlink("/proc/self/exe").parent_path() /
+							const auto component = raven_self_exe().parent_path() /
 								(name=="dwrite.dll" ? "raven-dwrite.dll" : name=="d2d1.dll" ? "raven-d2d1.dll" : "raven-uianimation.dll");
 							if (std::filesystem::exists(component))
 								return read_module(component.c_str());
@@ -484,7 +514,7 @@ int main(int argc, char **argv)
 										places.emplace_back(std::string(part));
 									rest = colon == rest.npos ? std::string_view() : rest.substr(colon + 1);
 								}
-							places.emplace_back(std::filesystem::read_symlink("/proc/self/exe").parent_path());
+							places.emplace_back(raven_self_exe().parent_path());
 							for (const auto &place : places)
 								if (std::filesystem::exists(place / name))
 									return read_module((place / name).c_str());
@@ -516,7 +546,7 @@ int main(int argc, char **argv)
 					};
 					// The guest heap component ships beside the runtime when the build provisioned it.
 					if (entry->image.is_64 && !modules.all().contains("raven-rtl.dll")) {
-						const auto component = std::filesystem::read_symlink("/proc/self/exe").parent_path() / "raven-rtl.dll";
+						const auto component = raven_self_exe().parent_path() / "raven-rtl.dll";
 						if (std::filesystem::exists(component))
 							modules.add("raven-rtl.dll", read_file(component.c_str()));
 					}
@@ -752,7 +782,7 @@ int main(int argc, char **argv)
 		if (run_entry) {
 #ifdef RAVEN_NATIVE_CPU
 			raven::LoadedImage loaded(image, image.image_base);
-			const auto bootstrap = std::filesystem::read_symlink("/proc/self/exe").parent_path() / "raven-bootstrap";
+			const auto bootstrap = raven_self_exe().parent_path() / "raven-bootstrap";
 			return native_result(raven::run_native_entry(image, loaded, bootstrap.string(), std::chrono::seconds(5)));
 #else
 			throw std::runtime_error("native execution requires an x86-64 Linux host");

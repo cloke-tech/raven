@@ -30,7 +30,7 @@ EventObject::EventObject(int descriptor) : type(0), local_signaled(false), descr
 {
 	try {
 		struct stat information{};
-		if (descriptor < 0 || ::fstat(descriptor, &information) || information.st_size != sizeof(Shared))
+		if (descriptor < 0 || ::fstat(descriptor, &information) || off_t(information.st_size) < off_t(sizeof(Shared)))
 			throw std::runtime_error("invalid event storage");
 		void *mapped = ::mmap(nullptr, sizeof(Shared), PROT_READ | PROT_WRITE, MAP_SHARED, descriptor, 0);
 		if (mapped == MAP_FAILED)

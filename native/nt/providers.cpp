@@ -1729,6 +1729,17 @@ size_t fast_stub_trap_offset(std::string_view module, std::string_view name)
 	return 0;
 }
 
+// MulDiv for a 32-bit program (stdcall, three words): rounds half away from zero, -1 for a zero divisor or a result beyond 32 bits.
+static const std::vector<uint8_t> &x86_muldiv_code()
+{
+	static const std::vector<uint8_t> code{
+		0x53, 0x8b, 0x44, 0x24, 0x08, 0xf7, 0x6c, 0x24, 0x0c, 0x8b, 0x4c, 0x24, 0x10, 0x85, 0xc9, 0x74, 0x3e, 0x89, 0xd3, 0x31, 0xcb, 0x85, 0xd2, 0x79,
+		0x07, 0xf7, 0xd8, 0x83, 0xd2, 0x00, 0xf7, 0xda, 0x85, 0xc9, 0x79, 0x02, 0xf7, 0xd9, 0x56, 0x89, 0xce, 0xd1, 0xee, 0x01, 0xf0, 0x83, 0xd2, 0x00,
+		0x39, 0xca, 0x73, 0x1a, 0xf7, 0xf1, 0x85, 0xdb, 0x78, 0x06, 0x85, 0xc0, 0x78, 0x10, 0xeb, 0x09, 0x3d, 0x00, 0x00, 0x00, 0x80, 0x77, 0x07, 0xf7,
+		0xd8, 0x5e, 0x5b, 0xc2, 0x0c, 0x00, 0x5e, 0xb8, 0xff, 0xff, 0xff, 0xff, 0x5b, 0xc2, 0x0c, 0x00};
+	return code;
+}
+
 std::vector<uint8_t> runtime_provider(std::string_view name, uint64_t base,
 	std::span<const std::string_view> exports, bool x86, std::span<const std::string_view> data_exports,
 	std::span<const std::pair<std::string_view, uint16_t>> ordinal_exports, bool fast_paths)
@@ -1828,7 +1839,14 @@ std::vector<uint8_t> runtime_provider(std::string_view name, uint64_t base,
 		for (const auto symbol : exports)
 			queued_count += queued_arguments(name, symbol) != 0;
 	const size_t queued_start = blocks_start + block_size;
-	const size_t end = queued_start + queued_count * queued_prelude_size;
+	// A 32-bit program multiplies and divides through MulDiv in its pixel loops; a trap for each call costs a round trip to the
+	// runtime, so the 32-bit provider answers it in the guest (see x86_muldiv_code).
+	const auto x86_inline = [&](std::string_view symbol) { return x86 && symbol == "MulDiv" && (name == "kernel32.dll" || name == "kernelbase.dll"); };
+	const size_t inline_start = queued_start + queued_count * queued_prelude_size;
+	size_t inline_count = 0;
+	for (const auto symbol : exports)
+		inline_count += x86_inline(symbol);
+	const size_t end = inline_start + inline_count * 96;
 	std::vector<uint8_t> bytes((end + 511) & ~size_t(511));
 	const auto rva = [](size_t offset) { return 0x1000 + offset - 0x200; };
 	const auto put = [&](size_t offset, uint64_t value, size_t width = 4) {
@@ -1881,7 +1899,7 @@ std::vector<uint8_t> runtime_provider(std::string_view name, uint64_t base,
 	text(module_name, name);
 	size_t cursor = module_name + name.size() + 1;
 	size_t fast_next = 0, served_next = 0, clock_next = 0, commit_next = 0, strings_next = strings_start, blocks_next = blocks_start;
-	size_t queued_next = queued_start;
+	size_t queued_next = queued_start, inline_next = 0;
 	for (size_t index = 0; index < exports.size(); ++index) {
 		size_t code = 0x200 + index * 16;
 		const uint32_t service = x86 ? 0 : nt_service_number(name, exports[index]);
@@ -1896,7 +1914,12 @@ std::vector<uint8_t> runtime_provider(std::string_view name, uint64_t base,
 		if (service) {
 			const std::array<uint8_t, 11> entry{0x4c, 0x8b, 0xd1, 0xb8, 0, 0, 0, 0, 0x0f, 0x05, 0xc3};
 			std::copy(entry.begin(), entry.end(), bytes.begin() + ptrdiff_t(code));
+#ifdef __APPLE__
+			// XNU raises EXC_SYSCALL for a Mach trap number it does not have; a plain number would run a BSD system call
+			put(code + 4, service | 0x1000000);
+#else
 			put(code + 4, service);
+#endif
 		}
 		if (!x86 && served_api(name, exports[index])) {
 			code = served_start + 64 + served_next++ * served_stub_size;
@@ -1951,6 +1974,11 @@ std::vector<uint8_t> runtime_provider(std::string_view name, uint64_t base,
 			queued_next += queued_prelude_size;
 			const auto prelude = queued_prelude(int32_t(served) - int32_t(code), queued_arguments(name, exports[index]), exports[index]);
 			std::copy(prelude.begin(), prelude.end(), bytes.begin() + ptrdiff_t(code));
+		}
+		if (x86_inline(exports[index])) {
+			code = inline_start + inline_next++ * 96;
+			const auto &body = x86_muldiv_code();
+			std::copy(body.begin(), body.end(), bytes.begin() + ptrdiff_t(code));
 		}
 		const auto data = std::find(data_exports.begin(), data_exports.end(), exports[index]);
 		const size_t entry = numbered ? slot_of[index] - 1 : index;

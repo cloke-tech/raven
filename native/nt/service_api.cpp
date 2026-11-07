@@ -62,6 +62,12 @@ bool alive(uint32_t pid)
 {
 	if (!pid)
 		return false;
+#ifdef __APPLE__
+	{
+		const auto process = raven_process(pid_t(pid));
+		return process.exists && !process.zombie;
+	}
+#endif
 	std::ifstream stat("/proc/" + std::to_string(pid) + "/stat");
 	std::string line;
 	if (!std::getline(stat, line))
